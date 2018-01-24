@@ -58,8 +58,8 @@ const (
 )
 
 const (
-	minElectionTimeout = 500
-	maxElectionTimeout = 800
+	minElectionTimeout = 400
+	maxElectionTimeout = 700
 	heartBeatInterval  = 100
 )
 
@@ -195,11 +195,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
+		debug(rf.me, rf.currentTerm, "reject voting req with lower term=%d\n", args.Term)
 		return
 	}
-	if rf.votedFor != nil && *rf.votedFor != args.CandidateID {
+	if args.Term == rf.currentTerm && rf.votedFor != nil && *rf.votedFor != args.CandidateID {
+		// same term, already vote for others
+		debug(rf.me, rf.currentTerm, "already vote for %d, rejecting voting req\n", *rf.votedFor)
 		return
 	}
+
+	// 1. not voting for anyone yet
+	// 2. vote for someone but this request has higher term
 
 	reply.VoteGranted = true
 	// request term is larger than currTerm
@@ -208,6 +214,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// vote for this request
 	id := args.CandidateID
 	rf.votedFor = &id
+
+	debug(rf.me, rf.currentTerm, "vote for server=%d\n", args.CandidateID)
 }
 
 // AppendEntries heartbeat handler
@@ -348,20 +356,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for {
 			select {
 			case <-timer.C:
-				// TODO timeout start election
-				fmt.Printf("server=%d starts election, term=%d\n", me, rf.currentTerm)
+				// timeout start election
 				rf.startElection()
 			case shouldReset := <-rf.electionTimerCh:
 				// reset timer
 				if shouldReset {
-					DPrintf("server=%d resets election timer, term=%d\n", me, rf.currentTerm)
 					timer = resetTimer(rf)
 				} else {
-					DPrintf("server=%d pauses election timer, term=%d\n", me, rf.currentTerm)
 					timer.Stop()
 				}
 			case <-rf.quit:
-				DPrintf("server=%d stops election goroutine\n", me)
+				rf.debug("stops election goroutine\n")
 				return
 			}
 		}
@@ -371,13 +376,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) startElection() {
-	// TODO implement election logic
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.role == leader {
+		debug(rf.me, rf.currentTerm, "already leader, skipping election timeout, term=%d\n", rf.currentTerm)
 		return
 	}
+	debug(rf.me, rf.currentTerm, "starts election, new term=%d\n", rf.currentTerm+1)
 
 	// increase term
 	rf.currentTerm++
@@ -386,6 +392,7 @@ func (rf *Raft) startElection() {
 	// vote itself
 	rf.votedFor = &rf.me
 	eleTerm := rf.currentTerm
+	// channel for granted votes
 	voteCh := make(chan int)
 	// # of votes required to become a leader
 	votesRequired := (len(rf.peers) + 1) / 2
@@ -400,11 +407,12 @@ func (rf *Raft) startElection() {
 			if _, ok := voteRecords[server]; !ok {
 				voteRecords[server] = true
 				count++
+				debug(rf.me, eleTerm,
+					"vote granted by peer=%d, total=%d, required=%d\n", server, count, votesRequired)
 			}
-			fmt.Printf("server=%d, vote=%d\n", rf.me, count)
-			fmt.Println(votesRequired)
 			if count == votesRequired {
 				// elected as leader
+				debug(rf.me, eleTerm, "got enough votes, count=%d\n", count)
 				break
 			}
 		}
@@ -414,10 +422,11 @@ func (rf *Raft) startElection() {
 			rf.role = leader
 			// TODO consider to stop timer entirely
 			rf.electionTimerCh <- true
-			DPrintf("server=%d becomes leader", rf.me)
-			fmt.Printf("server=%d is the leader, term=%d\n", rf.me, rf.currentTerm)
+			debug(rf.me, eleTerm, "elected as the leader in term=%d\n", rf.currentTerm)
 			// sending heartbeat
 			sendHeartBeat(rf, eleTerm)
+		} else {
+			debug(rf.me, eleTerm, "not becoming a leader, currTerm=%d, role=%d\n", rf.currentTerm, rf.role)
 		}
 		rf.mu.Unlock()
 	}(voteCh)
@@ -441,10 +450,11 @@ func (rf *Raft) startElection() {
 
 				if currTerm != term || role != candidate {
 					// stale request
+					debug(rf.me, term, "already pass this term, not sending vote req, currTerm=%d\n", currTerm)
 					return
 				}
 
-				DPrintf("server=%d sends vote request to peer=%d, term=%d", rf.me, server, currTerm)
+				debug(rf.me, term, "sends vote req to peer=%d\n", server)
 
 				reply := &RequestVoteReply{}
 				success := rf.sendRequestVote(server, &RequestVoteArgs{currTerm, rf.me}, reply)
@@ -452,9 +462,13 @@ func (rf *Raft) startElection() {
 					if reply.VoteGranted {
 						// report getting voted to leader
 						voteCh <- server
+					} else {
+						debug(rf.me, currTerm, "vote req rejected by peer=%d\n", server)
 					}
 					rf.checkTerm(reply.Term)
 					break
+				} else {
+					debug(rf.me, term, "fail to send vote req to peer=%d, retrying\n", server)
 				}
 			}
 			wg.Done()
@@ -464,7 +478,7 @@ func (rf *Raft) startElection() {
 	// wait for all vote request to finish
 	go func() {
 		wg.Wait()
-		// TODO add debug log
+		debug(rf.me, eleTerm, "all vote req goroutine finished\n")
 		close(voteCh)
 	}()
 }
@@ -472,12 +486,25 @@ func (rf *Raft) startElection() {
 func (rf *Raft) checkTerm(term int) {
 	rf.mu.Lock()
 	if term > rf.currentTerm {
+		debug(rf.me, rf.currentTerm, "receives higher term=%d, change to follower\n", term)
 		// switch back to follower
 		rf.currentTerm = term
 		rf.votedFor = nil
 		rf.role = follower
 	}
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) debug(format string, a ...interface{}) {
+	rf.mu.Lock()
+	serverStr := fmt.Sprintf("[s=%d,t=%d] ", rf.me, rf.currentTerm)
+	rf.mu.Unlock()
+	DPrintf(serverStr+format, a...)
+}
+
+func debug(server int, term int, format string, a ...interface{}) {
+	serverStr := fmt.Sprintf("[s=%d,t=%d] ", server, term)
+	DPrintf(serverStr+format, a...)
 }
 
 func sendHeartBeat(rf *Raft, term int) {
@@ -510,11 +537,12 @@ func sendHeartBeat(rf *Raft, term int) {
 				success := rf.sendAppendEntries(server, args, reply)
 
 				if !success {
-					fmt.Printf("server=%d failed to send heartbeat to peer=%d\n", rf.me, server)
+					debug(rf.me, currTerm, "fail to send heartbeat to peer=%d\n", server)
 				} else {
 					if !reply.Success {
-						// TODO add log
+						debug(rf.me, currTerm, "heartbeat rejected by peer=%d\n", server)
 					}
+					// check if the peer has higher term (if yes, become a follower)
 					rf.checkTerm(reply.Term)
 				}
 
