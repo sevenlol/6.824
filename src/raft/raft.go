@@ -60,7 +60,7 @@ const (
 const (
 	minElectionTimeout = 400
 	maxElectionTimeout = 700
-	heartBeatInterval  = 100
+	heartBeatInterval  = 200
 )
 
 //
@@ -80,6 +80,8 @@ type Raft struct {
 	currentTerm int
 	votedFor    *int
 	log         []*logEntry
+	// indicate the "real" size of log
+	logCount int
 
 	/* volatile */
 	role        peerRole
@@ -92,6 +94,7 @@ type Raft struct {
 
 	/* other */
 	electionTimerCh chan bool
+	appendEntriesCh chan int
 	quit            chan bool
 }
 
@@ -210,6 +213,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	// request term is larger than currTerm
 	rf.currentTerm = args.Term
+	// change to follower
+	rf.role = follower
 	reply.Term = args.Term
 	// vote for this request
 	id := args.CandidateID
@@ -218,7 +223,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	debug(rf.me, rf.currentTerm, "vote for server=%d\n", args.CandidateID)
 }
 
-// AppendEntries heartbeat handler
+// AppendEntries handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -312,7 +317,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-	// stop election goroutine
+	// stop election goroutine and append entries goroutine
+	// FIXME consider other solutions (maybe use condition variable)
+	rf.quit <- true
 	rf.quit <- true
 }
 
@@ -335,6 +342,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.electionTimerCh = make(chan bool)
+	rf.appendEntriesCh = make(chan int)
 	rf.quit = make(chan bool)
 
 	// Your initialization code here (2A, 2B, 2C).
@@ -351,7 +359,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// election goroutine
 	go func() {
-		timer := resetTimer(rf)
+		timer := resetTimer(rf, getElectionTimeoutDuration)
 
 		for {
 			select {
@@ -361,7 +369,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case shouldReset := <-rf.electionTimerCh:
 				// reset timer
 				if shouldReset {
-					timer = resetTimer(rf)
+					timer = resetTimer(rf, getElectionTimeoutDuration)
 				} else {
 					timer.Stop()
 				}
@@ -371,6 +379,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 		}
 	}()
+
+	// append entries goroutine
+	go startAppendEntriesWorkers(rf)
 
 	return rf
 }
@@ -423,8 +434,8 @@ func (rf *Raft) startElection() {
 			// TODO consider to stop timer entirely
 			rf.electionTimerCh <- true
 			debug(rf.me, eleTerm, "elected as the leader in term=%d\n", rf.currentTerm)
-			// sending heartbeat
-			sendHeartBeat(rf, eleTerm)
+			// sending heartbeat and log
+			rf.appendEntriesCh <- rf.currentTerm
 		} else {
 			debug(rf.me, eleTerm, "not becoming a leader, currTerm=%d, role=%d\n", rf.currentTerm, rf.role)
 		}
@@ -507,56 +518,85 @@ func debug(server int, term int, format string, a ...interface{}) {
 	DPrintf(serverStr+format, a...)
 }
 
-func sendHeartBeat(rf *Raft, term int) {
+// for AppendEntries (heartbeat and log)
+func startAppendEntriesWorkers(rf *Raft) {
+	timer := resetTimer(rf, getHeartbeatInterval)
+
+	for {
+		select {
+		case <-timer.C:
+			// timeout, send AppendEntries request
+			var term int
+			rf.mu.Lock()
+			term = rf.currentTerm
+			rf.mu.Unlock()
+			sendAllAppendEntriesRequests(rf, term)
+		case term := <-rf.appendEntriesCh:
+			// reset timer and send AppendEntries request
+			timer = resetTimer(rf, getHeartbeatInterval)
+			sendAllAppendEntriesRequests(rf, term)
+		case <-rf.quit:
+			// TODO consider using other triggers
+			rf.debug("stops append entries goroutine\n")
+			return
+		}
+	}
+}
+
+func sendAllAppendEntriesRequests(rf *Raft, term int) {
 	for i := range rf.peers {
 		if i == rf.me {
 			// skip itself
 			continue
 		}
-
-		go func(server int) {
-			for {
-				var currTerm int
-				var role peerRole
-				rf.mu.Lock()
-				currTerm = rf.currentTerm
-				role = rf.role
-				rf.mu.Unlock()
-
-				if currTerm != term || role != leader {
-					// not leader anymore or term changed
-					return
-				}
-				args := &AppendEntriesArgs{
-					Term:         term,
-					LeaderID:     rf.me,
-					LeaderCommit: rf.commitIndex,
-					// TODO add other params
-				}
-				reply := &AppendEntriesReply{}
-				success := rf.sendAppendEntries(server, args, reply)
-
-				if !success {
-					debug(rf.me, currTerm, "fail to send heartbeat to peer=%d\n", server)
-				} else {
-					if !reply.Success {
-						debug(rf.me, currTerm, "heartbeat rejected by peer=%d\n", server)
-					}
-					// check if the peer has higher term (if yes, become a follower)
-					rf.checkTerm(reply.Term)
-				}
-
-				time.Sleep(heartBeatInterval * time.Millisecond)
-			}
-		}(i)
+		go sendAppendEntriesRequest(rf, i, term)
 	}
 }
 
-func resetTimer(rf *Raft) *time.Ticker {
-	duration := getElectionTimeoutDuration()
+// send append entries requests to all servers
+func sendAppendEntriesRequest(rf *Raft, server int, term int) {
+	var currTerm int
+	var role peerRole
+	rf.mu.Lock()
+	currTerm = rf.currentTerm
+	role = rf.role
+	rf.mu.Unlock()
+
+	if currTerm != term || role != leader {
+		// not leader anymore, or term changed
+		// debug(rf.me, currTerm, "not a leader, not sending AppendEntries requests\n")
+		return
+	}
+	// debug(rf.me, currTerm, "sending heartbeat to server=%d\n", server)
+	args := &AppendEntriesArgs{
+		Term:         currTerm,
+		LeaderID:     rf.me,
+		LeaderCommit: rf.commitIndex,
+		// TODO add other params
+	}
+	reply := &AppendEntriesReply{}
+	success := rf.sendAppendEntries(server, args, reply)
+
+	if !success {
+		debug(rf.me, currTerm, "fail to send heartbeat to peer=%d\n", server)
+	} else {
+		if !reply.Success {
+			debug(rf.me, currTerm, "heartbeat rejected by peer=%d\n", server)
+		}
+		// check if the peer has higher term (if yes, become a follower)
+		rf.checkTerm(reply.Term)
+	}
+}
+
+func resetTimer(rf *Raft, fn func() int) *time.Ticker {
+	duration := fn()
 	timer := time.NewTicker(time.Duration(duration) * time.Millisecond)
-	DPrintf("peer=%d, election timeout=%d\n", rf.me, duration)
+	DPrintf("peer=%d, timeout=%d\n", rf.me, duration)
 	return timer
+}
+
+func getHeartbeatInterval() int {
+	return heartBeatInterval
 }
 
 func getElectionTimeoutDuration() int {
