@@ -46,7 +46,8 @@ type ApplyMsg struct {
 }
 
 type logEntry struct {
-	Term int
+	Term    int
+	Command interface{}
 }
 
 type peerRole int
@@ -58,9 +59,14 @@ const (
 )
 
 const (
-	minElectionTimeout = 400
-	maxElectionTimeout = 700
-	heartBeatInterval  = 200
+	minElectionTimeout = 220
+	maxElectionTimeout = 440
+	heartBeatInterval  = 130
+	rpcTimeout         = 500
+	startTimeout       = 5000
+
+	electionTimerName  = "election"
+	heartBeatTimerName = "heartbeat"
 )
 
 //
@@ -95,10 +101,12 @@ type Raft struct {
 
 	/* other */
 	electionTimerCh chan bool
-	appendEntriesCh chan int
+	appendEntriesCh chan bool
 	// indicate commitIndex changed to checking goroutine
 	commitCh chan bool
-	quit     chan bool
+	// indicate replication status (matchIndex) change
+	replicationCh chan bool
+	quit          chan bool
 }
 
 // return currentTerm and whether this server
@@ -189,8 +197,11 @@ type AppendEntriesArgs struct {
 
 // AppendEntriesReply RPC reply structure
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term         int
+	Success      bool
+	ConflictTerm int
+	// first index of conflict term
+	FirstLogIndex int
 }
 
 //
@@ -212,10 +223,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// peer's log is not as up to date as this server's, reject
-	if rf.logCount != 0 && (args.LastLogTerm < rf.log[rf.logCount-1].Term ||
+	if rf.logCount != 0 && args.LastLogTerm <= rf.logCount && (args.LastLogTerm < rf.log[rf.logCount-1].Term ||
 		(args.LastLogTerm == rf.log[rf.logCount-1].Term && args.LastLogIndex < rf.logCount)) {
 		debug(rf.me, rf.currentTerm, "candidate's log is older, rejecting vote request=%v,"+
 			"lastIndex=%d, lastTerm=%d\n", args, rf.logCount, rf.log[rf.logCount-1].Term)
+		// change to follower (args.Term is larger)
+		rf.currentTerm = args.Term
+		rf.role = follower
+		rf.votedFor = nil
+		reply.Term = args.Term
+		rf.c.Broadcast()
 		return
 	}
 
@@ -231,6 +248,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// vote for this request
 	id := args.CandidateID
 	rf.votedFor = &id
+	// reset election timer
+	rf.electionTimerCh <- true
 
 	debug(rf.me, rf.currentTerm, "vote for server=%d\n", args.CandidateID)
 }
@@ -240,7 +259,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	debug(rf.me, rf.currentTerm, "receives AppendEntries=%v\n", args)
+	debug(rf.me, rf.currentTerm, "receives AppendEntries=%v, logCount=%d\n", args, rf.logCount)
 
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -254,6 +273,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.votedFor = &leaderID
 	rf.role = follower
 
+	// reset timer
+	rf.electionTimerCh <- true
+
 	// configure reply
 	reply.Term = args.Term
 	reply.Success = true
@@ -263,6 +285,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		(rf.logCount < args.PrevLogIndex || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 		// reject
 		reply.Success = false
+		// set the conflict term and the first log index of that term
+		if rf.logCount >= args.PrevLogIndex {
+			reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
+			reply.FirstLogIndex = args.PrevLogIndex
+			for i := args.PrevLogIndex - 1; i > 0; i-- {
+				if rf.log[i-1].Term != rf.log[i].Term {
+					break
+				}
+				reply.FirstLogIndex = i
+			}
+		} else {
+			reply.ConflictTerm = rf.log[rf.logCount-1].Term
+			reply.FirstLogIndex = rf.logCount + 1
+		}
 		debug(rf.me, rf.currentTerm, "reject AppendEntries request=%v, logCount=%d\n", args, rf.logCount)
 		return
 	}
@@ -270,6 +306,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// update commit index (after prev log entry is valid)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
+		go func() {
+			rf.commitCh <- true
+		}()
 		debug(rf.me, rf.currentTerm, "update commit from leader=%d to %d\n", args.LeaderID, args.LeaderCommit)
 	}
 
@@ -279,11 +318,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		start := args.PrevLogIndex
 		for i := 0; i < len(args.Entries); i++ {
 			if i+start < len(rf.log) {
-				rf.log[i] = args.Entries[i]
+				rf.log[i+start] = args.Entries[i]
 			} else {
 				rf.log = append(rf.log, args.Entries[i])
 			}
 		}
+		rf.logCount = args.PrevLogIndex + len(args.Entries)
 		debug(rf.me, rf.currentTerm, "update log entries from leader=%d, size=%d\n", args.LeaderID, rf.logCount)
 	}
 }
@@ -346,7 +386,29 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	isLeader = (rf.role == leader)
+	term = rf.currentTerm
+	if isLeader {
+		entry := &logEntry{
+			Term:    rf.currentTerm,
+			Command: command,
+		}
+		if rf.logCount < len(rf.log) {
+			rf.log[rf.logCount] = entry
+		} else {
+			rf.log = append(rf.log, entry)
+		}
+		rf.logCount++
+		index = rf.logCount
+		debug(rf.me, rf.currentTerm, "append command=%v to index=%d\n", command, index)
+		rf.appendEntriesCh <- true
 
+		debug(rf.me, rf.currentTerm, "Start() succeeds, command=%v, index=%d\n", command, index)
+	} else {
+		debug(rf.me, rf.currentTerm, "not a leader, skip Start, command=%v\n", command)
+	}
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -359,9 +421,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	// stop election goroutine and append entries goroutine
+
+	rf.debug("Kill()\n")
 	// FIXME consider other solutions (maybe use condition variable)
-	rf.quit <- true
-	rf.quit <- true
+	// send until block
+	for {
+		select {
+		case rf.quit <- true:
+		default:
+			// FIXME maybe use waitgroup to wait for all of the goroutines finished
+			return
+		}
+	}
 }
 
 //
@@ -383,8 +454,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.c = sync.NewCond(&rf.mu)
 
+	rf.commitCh = make(chan bool)
 	rf.electionTimerCh = make(chan bool)
-	rf.appendEntriesCh = make(chan int)
+	rf.appendEntriesCh = make(chan bool)
+	rf.replicationCh = make(chan bool)
 	rf.quit = make(chan bool)
 
 	// Your initialization code here (2A, 2B, 2C).
@@ -404,6 +477,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// append entries goroutine
 	go startAppendEntriesWorkers(rf)
+
+	// check replication status and update commitIndex goroutine
+	go startReplicationStatusChecker(rf)
+
+	// apply committed log entries
+	go startLogEntryWorker(rf, applyCh)
 
 	return rf
 }
@@ -450,7 +529,7 @@ func (rf *Raft) startElection() {
 			}
 		}
 		rf.mu.Lock()
-		if rf.currentTerm == eleTerm && rf.role == candidate {
+		if rf.currentTerm == eleTerm && rf.role == candidate && count >= votesRequired {
 			// still in this term
 
 			// change role
@@ -465,10 +544,14 @@ func (rf *Raft) startElection() {
 			// TODO consider to stop timer entirely
 			rf.electionTimerCh <- true
 			debug(rf.me, eleTerm, "elected as the leader in term=%d\n", rf.currentTerm)
-			// sending heartbeat and log
-			rf.appendEntriesCh <- rf.currentTerm
+			// reset heartbeat timer only
+			rf.appendEntriesCh <- false
 		} else {
-			debug(rf.me, eleTerm, "not becoming a leader, currTerm=%d, role=%d\n", rf.currentTerm, rf.role)
+			// not enough vote
+			rf.role = follower
+			rf.votedFor = nil
+			debug(rf.me, eleTerm, "not elected, change to follower, currTerm=%d, role=%d, grantedVotes=%d\n",
+				rf.currentTerm, rf.role, count)
 		}
 		rf.mu.Unlock()
 	}(voteCh)
@@ -503,14 +586,25 @@ func (rf *Raft) startElection() {
 				}
 
 				debug(rf.me, term, "sends vote req to peer=%d\n", server)
-
-				reply := &RequestVoteReply{}
-				success := rf.sendRequestVote(server, &RequestVoteArgs{
+				args := &RequestVoteArgs{
 					Term:         currTerm,
 					CandidateID:  rf.me,
 					LastLogIndex: lastLogIndex,
 					LastLogTerm:  lastLogTerm,
-				}, reply)
+				}
+				reply := &RequestVoteReply{}
+				replyCh := make(chan bool, 1)
+				go func() {
+					replyCh <- rf.sendRequestVote(server, args, reply)
+				}()
+
+				success := false
+				select {
+				case success = <-replyCh:
+				case <-time.After(rpcTimeout * time.Millisecond):
+					debug(rf.me, currTerm, "vote request to peer=%d timeout\n", server)
+				}
+
 				if success {
 					if reply.VoteGranted {
 						// report getting voted to leader
@@ -544,6 +638,8 @@ func (rf *Raft) checkTerm(term int) {
 		rf.currentTerm = term
 		rf.votedFor = nil
 		rf.role = follower
+		rf.electionTimerCh <- true
+		rf.c.Broadcast()
 	}
 	rf.mu.Unlock()
 }
@@ -560,14 +656,91 @@ func debug(server int, term int, format string, a ...interface{}) {
 	DPrintf(serverStr+format, a...)
 }
 
+// check if logs have been replicated to majority of servers
+func startReplicationStatusChecker(rf *Raft) {
+	for {
+		select {
+		case <-rf.replicationCh:
+			rf.mu.Lock()
+			// TODO check matchIndex
+			quorem := (len(rf.peers) + 1) / 2
+			oldCommitIndex := rf.commitIndex
+			for i := oldCommitIndex + 1; i <= rf.logCount; i++ {
+				// check if this log entry has been replicated to the majority servers
+				// and check if the commit is on this term
+				count := 1
+				for server := range rf.peers {
+					if server == rf.me {
+						// skip self
+						continue
+					}
+
+					if rf.matchIndex[server] >= i {
+						// server has log entry with index i
+						count++
+					}
+				}
+
+				debug(rf.me, rf.currentTerm, "checking log index=%d, replicas=%d\n", i, count)
+				if count < quorem {
+					// not reach quorem
+					break
+				} else if rf.log[i-1].Term != rf.currentTerm {
+					// previous term, cannot commit
+					debug(rf.me, rf.currentTerm,
+						"log index=%d is in previous term=%d, not commit\n", i, rf.log[i-1].Term)
+					continue
+				} else {
+					rf.commitIndex = i
+				}
+			}
+			debug(rf.me, rf.currentTerm, "prev commit=%d, curr commit=%d\n", oldCommitIndex, rf.commitIndex)
+			if rf.commitIndex > oldCommitIndex {
+				// wait all Start() up
+				rf.c.Broadcast()
+				// signal commit changes for worker to apply commited logs
+				rf.commitCh <- true
+			}
+			rf.mu.Unlock()
+		case <-rf.quit:
+			rf.debug("stops replication status checker goroutine\n")
+			return
+		}
+	}
+}
+
 // apply commit when commitIndex change
-func startLogEntryWorker(rf *Raft) {
-	// TODO implement
+func startLogEntryWorker(rf *Raft, applyCh chan ApplyMsg) {
+	// send ApplyMsg to applyCh
+	for {
+		select {
+		case <-rf.commitCh:
+			rf.mu.Lock()
+			debug(rf.me, rf.currentTerm, "lastApplied=%d, commitIndex=%d\n", rf.lastApplied, rf.commitIndex)
+			if rf.lastApplied < rf.commitIndex {
+				// i = log slice index = log index - 1
+				for i := rf.lastApplied; i < rf.commitIndex; i++ {
+					msg := ApplyMsg{
+						CommandValid: true,
+						CommandIndex: i + 1,
+						Command:      rf.log[i].Command,
+					}
+					applyCh <- msg
+				}
+				debug(rf.me, rf.currentTerm, "apply log entries from %d to %d\n", rf.lastApplied+1, rf.commitIndex)
+				rf.lastApplied = rf.commitIndex
+			}
+			rf.mu.Unlock()
+		case <-rf.quit:
+			rf.debug("stops log entry goroutine\n")
+			return
+		}
+	}
 }
 
 // when election timeout ellapse, start new election
 func startElectionWorker(rf *Raft) {
-	timer := resetTimer(rf, getElectionTimeoutDuration)
+	timer := resetTimer(rf, getElectionTimeoutDuration, electionTimerName)
 
 	for {
 		select {
@@ -577,7 +750,7 @@ func startElectionWorker(rf *Raft) {
 		case shouldReset := <-rf.electionTimerCh:
 			// reset timer
 			if shouldReset {
-				timer = resetTimer(rf, getElectionTimeoutDuration)
+				timer = resetTimer(rf, getElectionTimeoutDuration, electionTimerName)
 			} else {
 				timer.Stop()
 			}
@@ -590,41 +763,62 @@ func startElectionWorker(rf *Raft) {
 
 // for AppendEntries (heartbeat and log)
 func startAppendEntriesWorkers(rf *Raft) {
-	timer := resetTimer(rf, getHeartbeatInterval)
+	triggers := make([]chan bool, len(rf.peers))
+	for i := range rf.peers {
+		triggers[i] = make(chan bool)
+		if i != rf.me {
+			go startAppendEntryWorker(rf, i, triggers[i])
+		}
+	}
 
 	for {
 		select {
-		case <-timer.C:
-			// timeout, send AppendEntries request
-			var term int
-			rf.mu.Lock()
-			term = rf.currentTerm
-			rf.mu.Unlock()
-			sendAllAppendEntriesRequests(rf, term)
-		case term := <-rf.appendEntriesCh:
+		case shouldSend := <-rf.appendEntriesCh:
 			// reset timer and send AppendEntries request
-			timer = resetTimer(rf, getHeartbeatInterval)
-			sendAllAppendEntriesRequests(rf, term)
+			triggerAll(triggers, shouldSend)
 		case <-rf.quit:
-			// TODO consider using other triggers
+			// FIXME remove these
 			rf.debug("stops append entries goroutine\n")
 			return
 		}
 	}
 }
 
-func sendAllAppendEntriesRequests(rf *Raft, term int) {
-	for i := range rf.peers {
-		if i == rf.me {
-			// skip itself
-			continue
+func triggerAll(triggers []chan bool, shouldSend bool) {
+	for _, ch := range triggers {
+		ch := ch
+		select {
+		case ch <- shouldSend:
+		default:
 		}
-		go sendAppendEntriesRequest(rf, i, term)
+	}
+}
+
+func startAppendEntryWorker(rf *Raft, server int, ch chan bool) {
+	timer := resetTimer(rf, getHeartbeatInterval, heartBeatTimerName)
+	for {
+		select {
+		case <-timer.C:
+			// timeout, send AppendEntries request
+			timer.Stop()
+			sendAppendEntriesRequest(rf, server)
+			timer = resetTimer(rf, getHeartbeatInterval, heartBeatTimerName)
+		case shouldSend := <-ch:
+			// reset timer and send AppendEntries request
+			timer = resetTimer(rf, getHeartbeatInterval, heartBeatTimerName)
+			if shouldSend {
+				timer.Stop()
+				sendAppendEntriesRequest(rf, server)
+				timer = resetTimer(rf, getHeartbeatInterval, heartBeatTimerName)
+			}
+		case <-rf.quit:
+			return
+		}
 	}
 }
 
 // send append entries requests to all servers
-func sendAppendEntriesRequest(rf *Raft, server int, term int) {
+func sendAppendEntriesRequest(rf *Raft, server int) {
 	var currTerm int
 	var role peerRole
 	var entries []*logEntry
@@ -635,13 +829,16 @@ func sendAppendEntriesRequest(rf *Raft, server int, term int) {
 	rf.mu.Lock()
 	currTerm = rf.currentTerm
 	role = rf.role
-	if currTerm == term && role == leader {
+	if role == leader {
 		// generate unsent log entries
+		// FIXME remove
+		// fmt.Printf("server=%d, logCount=%d, nextIndex=%d\n", rf.me, rf.logCount, rf.nextIndex[server])
 		nextIndex := rf.nextIndex[server]
 		if rf.logCount != 0 && nextIndex <= rf.logCount {
 			entries = rf.log[nextIndex-1 : rf.logCount]
 			debug(rf.me, currTerm, "sending entries[%d:%d] to peer=%d\n", nextIndex-1, rf.logCount, server)
 		}
+		// fmt.Printf("entries=%v\n", entries)
 		nextLogIndex = rf.logCount + 1
 		// set previous log entry (if nextIndex is not 1)
 		if nextIndex > 1 {
@@ -652,12 +849,12 @@ func sendAppendEntriesRequest(rf *Raft, server int, term int) {
 	}
 	rf.mu.Unlock()
 
-	if currTerm != term || role != leader {
+	if role != leader {
 		// not leader anymore, or term changed
 		// debug(rf.me, currTerm, "not a leader, not sending AppendEntries requests\n")
 		return
 	}
-	// debug(rf.me, currTerm, "sending heartbeat to server=%d\n", server)
+	debug(rf.me, currTerm, "sending heartbeat to server=%d\n", server)
 	args := &AppendEntriesArgs{
 		Term:         currTerm,
 		LeaderID:     rf.me,
@@ -667,7 +864,18 @@ func sendAppendEntriesRequest(rf *Raft, server int, term int) {
 		Entries:      entries,
 	}
 	reply := &AppendEntriesReply{}
-	success := rf.sendAppendEntries(server, args, reply)
+
+	replyCh := make(chan bool, 1)
+	go func() {
+		replyCh <- rf.sendAppendEntries(server, args, reply)
+	}()
+
+	success := false
+	select {
+	case success = <-replyCh:
+	case <-time.After(rpcTimeout * time.Millisecond):
+		debug(rf.me, currTerm, "AppendEntries to peer=%d timeout\n", server)
+	}
 
 	if !success {
 		debug(rf.me, currTerm, "fail to send AppendEntries to peer=%d\n", server)
@@ -677,8 +885,14 @@ func sendAppendEntriesRequest(rf *Raft, server int, term int) {
 			debug(rf.me, currTerm, "AppendEntries rejected by peer=%d\n", server)
 			if prevLogIndex == rf.nextIndex[server]-1 {
 				// index not changed
-				// decrement nextIndex by 1
-				rf.nextIndex[server]--
+				if reply.ConflictTerm == 0 {
+					// decrement nextIndex by 1
+					rf.nextIndex[server]--
+				} else {
+					// set to first log index
+					rf.nextIndex[server] = reply.FirstLogIndex
+				}
+
 				debug(rf.me, currTerm, "decrement nextIndex[%d] to %d\n", server, rf.nextIndex[server])
 			}
 		} else {
@@ -686,6 +900,11 @@ func sendAppendEntriesRequest(rf *Raft, server int, term int) {
 			if nextLogIndex > rf.nextIndex[server] {
 				rf.nextIndex[server] = nextLogIndex
 				rf.matchIndex[server] = nextLogIndex - 1
+				// signal matchIndex changed
+				go func() {
+					// TODO check this
+					rf.replicationCh <- true
+				}()
 				debug(rf.me, currTerm, "update peer=%d, nextIndex to %d, matchIndex to %d\n",
 					server, rf.nextIndex[server], rf.matchIndex[server])
 			}
@@ -696,10 +915,10 @@ func sendAppendEntriesRequest(rf *Raft, server int, term int) {
 	}
 }
 
-func resetTimer(rf *Raft, fn func() int) *time.Ticker {
-	duration := fn()
+func resetTimer(rf *Raft, getDuration func() int, timerName string) *time.Ticker {
+	duration := getDuration()
 	timer := time.NewTicker(time.Duration(duration) * time.Millisecond)
-	DPrintf("peer=%d, timeout=%d\n", rf.me, duration)
+	rf.debug("resets %s timer, duration=%d\n", timerName, duration)
 	return timer
 }
 
