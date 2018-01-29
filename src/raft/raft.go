@@ -512,49 +512,7 @@ func (rf *Raft) startElection() {
 	wg.Add(len(rf.peers))
 
 	// handle granted vote
-	go func(ch chan int) {
-		voteRecords := make(map[int]bool)
-		count := 1
-		for server := range ch {
-			if _, ok := voteRecords[server]; !ok {
-				voteRecords[server] = true
-				count++
-				debug(rf.me, eleTerm,
-					"vote granted by peer=%d, total=%d, required=%d\n", server, count, votesRequired)
-			}
-			if count == votesRequired {
-				// elected as leader
-				debug(rf.me, eleTerm, "got enough votes, count=%d\n", count)
-				break
-			}
-		}
-		rf.mu.Lock()
-		if rf.currentTerm == eleTerm && rf.role == candidate && count >= votesRequired {
-			// still in this term
-
-			// change role
-			rf.role = leader
-			rf.nextIndex = make([]int, len(rf.peers))
-			rf.matchIndex = make([]int, len(rf.peers))
-			// initialize to last log index + 1
-			// NOTE log index starts at 1
-			for i := range rf.nextIndex {
-				rf.nextIndex[i] = rf.logCount + 1
-			}
-			// TODO consider to stop timer entirely
-			rf.electionTimerCh <- true
-			debug(rf.me, eleTerm, "elected as the leader in term=%d\n", rf.currentTerm)
-			// reset heartbeat timer only
-			rf.appendEntriesCh <- false
-		} else {
-			// not enough vote
-			rf.role = follower
-			rf.votedFor = nil
-			debug(rf.me, eleTerm, "not elected, change to follower, currTerm=%d, role=%d, grantedVotes=%d\n",
-				rf.currentTerm, rf.role, count)
-		}
-		rf.mu.Unlock()
-	}(voteCh)
+	go rf.startVoteHandler(voteCh, votesRequired, eleTerm)
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -564,62 +522,7 @@ func (rf *Raft) startElection() {
 		}
 
 		// send vote request
-		go func(server int, term int) {
-			var currTerm int
-			var role peerRole
-			for {
-				lastLogIndex := 0
-				lastLogTerm := 0
-				rf.mu.Lock()
-				currTerm = rf.currentTerm
-				role = rf.role
-				if rf.logCount > 0 {
-					lastLogIndex = rf.logCount
-					lastLogTerm = rf.log[rf.logCount-1].Term
-				}
-				rf.mu.Unlock()
-
-				if currTerm != term || role != candidate {
-					// stale request
-					debug(rf.me, term, "already pass this term, not sending vote req, currTerm=%d\n", currTerm)
-					return
-				}
-
-				debug(rf.me, term, "sends vote req to peer=%d\n", server)
-				args := &RequestVoteArgs{
-					Term:         currTerm,
-					CandidateID:  rf.me,
-					LastLogIndex: lastLogIndex,
-					LastLogTerm:  lastLogTerm,
-				}
-				reply := &RequestVoteReply{}
-				replyCh := make(chan bool, 1)
-				go func() {
-					replyCh <- rf.sendRequestVote(server, args, reply)
-				}()
-
-				success := false
-				select {
-				case success = <-replyCh:
-				case <-time.After(rpcTimeout * time.Millisecond):
-					debug(rf.me, currTerm, "vote request to peer=%d timeout\n", server)
-				}
-
-				if success {
-					if reply.VoteGranted {
-						// report getting voted to leader
-						voteCh <- server
-					} else {
-						debug(rf.me, currTerm, "vote req rejected by peer=%d\n", server)
-					}
-					rf.checkTerm(reply.Term)
-					break
-				} else {
-					debug(rf.me, term, "fail to send vote req to peer=%d, retrying\n", server)
-				}
-			}
-			wg.Done()
-		}(i, eleTerm)
+		go rf.sendVoteRequest(i, eleTerm, wg, voteCh)
 	}
 
 	// wait for all vote request to finish
@@ -640,6 +543,107 @@ func (rf *Raft) checkTerm(term int) {
 		rf.role = follower
 		rf.electionTimerCh <- true
 		rf.c.Broadcast()
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendVoteRequest(server int, term int, wg *sync.WaitGroup, voteCh chan int) {
+	var currTerm int
+	var role peerRole
+	for {
+		lastLogIndex := 0
+		lastLogTerm := 0
+		rf.mu.Lock()
+		currTerm = rf.currentTerm
+		role = rf.role
+		if rf.logCount > 0 {
+			lastLogIndex = rf.logCount
+			lastLogTerm = rf.log[rf.logCount-1].Term
+		}
+		rf.mu.Unlock()
+
+		if currTerm != term || role != candidate {
+			// stale request
+			debug(rf.me, term, "already pass this term, not sending vote req, currTerm=%d\n", currTerm)
+			return
+		}
+
+		debug(rf.me, term, "sends vote req to peer=%d\n", server)
+		args := &RequestVoteArgs{
+			Term:         currTerm,
+			CandidateID:  rf.me,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+		}
+		reply := &RequestVoteReply{}
+		replyCh := make(chan bool, 1)
+		go func() {
+			replyCh <- rf.sendRequestVote(server, args, reply)
+		}()
+
+		success := false
+		select {
+		case success = <-replyCh:
+		case <-time.After(rpcTimeout * time.Millisecond):
+			debug(rf.me, currTerm, "vote request to peer=%d timeout\n", server)
+		}
+
+		if success {
+			if reply.VoteGranted {
+				// report getting voted to leader
+				voteCh <- server
+			} else {
+				debug(rf.me, currTerm, "vote req rejected by peer=%d\n", server)
+			}
+			rf.checkTerm(reply.Term)
+			break
+		} else {
+			debug(rf.me, term, "fail to send vote req to peer=%d, retrying\n", server)
+		}
+	}
+	wg.Done()
+}
+
+func (rf *Raft) startVoteHandler(ch chan int, votesRequired int, term int) {
+	voteRecords := make(map[int]bool)
+	count := 1
+	for server := range ch {
+		if _, ok := voteRecords[server]; !ok {
+			voteRecords[server] = true
+			count++
+			debug(rf.me, term,
+				"vote granted by peer=%d, total=%d, required=%d\n", server, count, votesRequired)
+		}
+		if count == votesRequired {
+			// elected as leader
+			debug(rf.me, term, "got enough votes, count=%d\n", count)
+			break
+		}
+	}
+	rf.mu.Lock()
+	if rf.currentTerm == term && rf.role == candidate && count >= votesRequired {
+		// still in this term
+
+		// change role
+		rf.role = leader
+		rf.nextIndex = make([]int, len(rf.peers))
+		rf.matchIndex = make([]int, len(rf.peers))
+		// initialize to last log index + 1
+		// NOTE log index starts at 1
+		for i := range rf.nextIndex {
+			rf.nextIndex[i] = rf.logCount + 1
+		}
+		// TODO consider to stop timer entirely
+		rf.electionTimerCh <- true
+		debug(rf.me, term, "elected as the leader in term=%d\n", rf.currentTerm)
+		// reset heartbeat timer only
+		rf.appendEntriesCh <- false
+	} else {
+		// not enough vote
+		rf.role = follower
+		rf.votedFor = nil
+		debug(rf.me, term, "not elected, change to follower, currTerm=%d, role=%d, grantedVotes=%d\n",
+			rf.currentTerm, rf.role, count)
 	}
 	rf.mu.Unlock()
 }
