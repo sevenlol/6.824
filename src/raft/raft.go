@@ -61,9 +61,9 @@ const (
 )
 
 const (
-	minElectionTimeout = 310
-	maxElectionTimeout = 550
-	heartBeatInterval  = 100
+	minElectionTimeout = 750
+	maxElectionTimeout = 950
+	heartBeatInterval  = 120
 	rpcTimeout         = 5000
 	startTimeout       = 5000
 
@@ -109,6 +109,7 @@ type Raft struct {
 	// indicate replication status (matchIndex) change
 	replicationCh chan bool
 	quit          chan bool
+	applyCh       chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -260,7 +261,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		debug(rf.me, rf.currentTerm, "reject voting req with lower term=%d\n", args.Term)
 		return
 	}
-	if args.Term == rf.currentTerm && rf.votedFor != nil && *rf.votedFor != args.CandidateID {
+	if args.Term > rf.currentTerm {
+		if rf.role == leader {
+			rf.electionTimerCh <- true
+		}
+		rf.currentTerm = args.Term
+		rf.role = follower
+		rf.votedFor = nil
+		reply.Term = args.Term
+		rf.persist()
+	}
+	if rf.votedFor != nil && *rf.votedFor != args.CandidateID {
 		// same term, already vote for others
 		debug(rf.me, rf.currentTerm, "already vote for %d, rejecting voting req\n", *rf.votedFor)
 		return
@@ -269,13 +280,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.logCount != 0 && (args.LastLogTerm < rf.log[rf.logCount-1].Term ||
 		(args.LastLogTerm == rf.log[rf.logCount-1].Term && args.LastLogIndex < rf.logCount)) {
 		debug(rf.me, rf.currentTerm, "candidate's log is older, rejecting vote request=%v,"+
-			"lastIndex=%d, lastTerm=%d\n", args, rf.logCount, rf.log[rf.logCount-1].Term)
-		// change to follower (args.Term is larger)
-		rf.currentTerm = args.Term
-		rf.role = follower
-		rf.votedFor = nil
-		reply.Term = args.Term
-		rf.persist()
+			"lastIndex=%d, lastTerm=%d, role=%d\n", args, rf.logCount, rf.log[rf.logCount-1].Term, rf.role)
 		rf.c.Broadcast()
 		return
 	}
@@ -284,11 +289,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2. vote for someone but this request has higher term
 
 	reply.VoteGranted = true
-	// request term is larger than currTerm
-	rf.currentTerm = args.Term
-	// change to follower
-	rf.role = follower
-	reply.Term = args.Term
 	// vote for this request
 	id := args.CandidateID
 	rf.votedFor = &id
@@ -308,17 +308,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
-		reply.FirstLogIndex = rf.logCount
+		reply.Success = false
+		reply.ConflictTerm = 0
+		reply.FirstLogIndex = rf.logCount + 1
 		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.role = follower
+		rf.votedFor = nil
+		reply.Term = args.Term
 	}
 
 	leaderID := args.LeaderID
 
-	// reset timer (only for current leader)
-	if rf.votedFor != nil && *rf.votedFor == args.LeaderID {
+	// reset timer (higher term or current leader)
+	if rf.votedFor == nil || *rf.votedFor == args.LeaderID {
 		rf.electionTimerCh <- true
-	} else {
-		debug(rf.me, rf.currentTerm, "not current leader\n")
 	}
 
 	// accept leader request and change to follower
@@ -328,14 +335,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 
 	// configure reply
-	reply.Term = args.Term
 	reply.Success = true
 
 	// no PrevLogIndex in log
 	if args.PrevLogIndex != 0 && rf.logCount < args.PrevLogIndex {
 		reply.Success = false
 		reply.ConflictTerm = 0
-		reply.FirstLogIndex = rf.logCount
+		reply.FirstLogIndex = rf.logCount + 1
 		debug(rf.me, rf.currentTerm, "reject AppendEntries request=%v, logCount=%d\n", args, rf.logCount)
 		return
 	}
@@ -346,31 +352,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// set the conflict term and the first log index of that term
 		reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
 		reply.FirstLogIndex = args.PrevLogIndex
-		for i := args.PrevLogIndex - 1; i > 0; i-- {
+		for i := 1; i <= rf.logCount; i++ {
+			if rf.log[i-1].Term == reply.ConflictTerm {
+				reply.FirstLogIndex = i
+				break
+			}
+		}
+		/* for i := args.PrevLogIndex - 1; i > 0; i-- {
+			reply.FirstLogIndex = i + 1
 			if rf.log[i-1].Term != rf.log[i].Term {
 				break
 			}
-			reply.FirstLogIndex = i
-		}
+		} */
 		debug(rf.me, rf.currentTerm,
 			"reject AppendEntries request=%v, logCount=%d, conflictTerm=%d, conflictIndex=%d\n",
 			args, rf.logCount, reply.ConflictTerm, reply.FirstLogIndex)
 		return
-	}
-
-	// update commit index (after prev log entry is valid)
-	if args.LeaderCommit > rf.commitIndex {
-		lastNewLogIndex := args.PrevLogIndex + len(args.Entries)
-		if lastNewLogIndex < args.LeaderCommit {
-			rf.commitIndex = lastNewLogIndex
-		} else {
-			rf.commitIndex = args.LeaderCommit
-		}
-
-		go func() {
-			rf.commitCh <- true
-		}()
-		debug(rf.me, rf.currentTerm, "update commit from leader=%d to %d\n", args.LeaderID, rf.commitIndex)
 	}
 
 	// store entries from args and remove all logs after entries
@@ -396,6 +393,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.persist()
 		debug(rf.me, rf.currentTerm, "update log entries from leader=%d, size=%d\n", args.LeaderID, rf.logCount)
+	}
+
+	// update commit index (after prev log entry is valid)
+	if args.LeaderCommit > rf.commitIndex {
+		lastNewLogIndex := args.PrevLogIndex + len(args.Entries)
+		if lastNewLogIndex < args.LeaderCommit {
+			rf.commitIndex = lastNewLogIndex
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+
+		/* go func() {
+			rf.commitCh <- true
+		}() */
+		rf.checkCommit()
+		debug(rf.me, rf.currentTerm, "update commit from leader=%d to %d\n", args.LeaderID, rf.commitIndex)
 	}
 }
 
@@ -474,7 +487,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = rf.logCount
 		rf.persist()
 		debug(rf.me, rf.currentTerm, "append command=%v to index=%d\n", command, index)
-		rf.appendEntriesCh <- true
+		drainAndAdd(rf.appendEntriesCh, true)
 		// debug(rf.me, rf.currentTerm, "Start() succeeds, command=%v, index=%d\n", command, index)
 	} else {
 		// debug(rf.me, rf.currentTerm, "not a leader, skip Start, command=%v\n", command)
@@ -496,6 +509,10 @@ func (rf *Raft) Kill() {
 	rf.debug("Kill()\n")
 	// FIXME consider other solutions (maybe use condition variable)
 	// send until block
+	rf.mu.Lock()
+	rf.role = follower
+	rf.c.Broadcast()
+	rf.mu.Unlock()
 	for {
 		select {
 		case rf.quit <- true:
@@ -527,9 +544,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.commitCh = make(chan bool)
 	rf.electionTimerCh = make(chan bool)
-	rf.appendEntriesCh = make(chan bool)
+	rf.appendEntriesCh = make(chan bool, 1)
 	rf.replicationCh = make(chan bool)
 	rf.quit = make(chan bool)
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -664,6 +682,16 @@ func (rf *Raft) sendVoteRequest(server int, term int, wg *sync.WaitGroup, voteCh
 
 		if success {
 			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				debug(rf.me, rf.currentTerm, "receives higher term=%d, change to follower\n", reply.Term)
+				// switch back to follower
+				rf.currentTerm = reply.Term
+				rf.votedFor = nil
+				rf.role = follower
+				rf.persist()
+				rf.mu.Unlock()
+				return
+			}
 			if rf.currentTerm != currTerm {
 				debug(rf.me, rf.currentTerm, "vote request sent in old term=%d, ignore\n", currTerm)
 				rf.mu.Unlock()
@@ -676,7 +704,6 @@ func (rf *Raft) sendVoteRequest(server int, term int, wg *sync.WaitGroup, voteCh
 			} else {
 				debug(rf.me, currTerm, "vote req rejected by peer=%d\n", server)
 			}
-			rf.checkTerm(reply.Term)
 			break
 		} else {
 			debug(rf.me, term, "fail to send vote req to peer=%d, retrying\n", server)
@@ -710,10 +737,11 @@ func (rf *Raft) startVoteHandler(ch chan int, votesRequired int, term int) {
 		rf.persist()
 		rf.initializeLeaderState()
 		// TODO consider to stop timer entirely
-		// rf.electionTimerCh <- true
+		rf.electionTimerCh <- false
 		debug(rf.me, term, "elected as the leader in term=%d\n", rf.currentTerm)
 		// reset heartbeat timer only
-		rf.appendEntriesCh <- false
+		rf.c.Broadcast()
+		drainAndAdd(rf.appendEntriesCh, true)
 	} else {
 		// not enough vote
 		rf.role = follower
@@ -730,6 +758,23 @@ func (rf *Raft) debug(format string, a ...interface{}) {
 	serverStr := fmt.Sprintf("[s=%d,t=%d] ", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 	DPrintf(serverStr+format, a...)
+}
+
+func (rf *Raft) checkCommit() {
+	applyCh := rf.applyCh
+	if rf.lastApplied < rf.commitIndex {
+		// i = log slice index = log index - 1
+		for i := rf.lastApplied; i < rf.commitIndex; i++ {
+			msg := ApplyMsg{
+				CommandValid: true,
+				CommandIndex: i + 1,
+				Command:      rf.log[i].Command,
+			}
+			applyCh <- msg
+		}
+		debug(rf.me, rf.currentTerm, "apply log entries from %d to %d\n", rf.lastApplied+1, rf.commitIndex)
+		rf.lastApplied = rf.commitIndex
+	}
 }
 
 func (rf *Raft) initializeLeaderState() {
@@ -777,7 +822,8 @@ func (rf *Raft) checkReplicationStatus() {
 	debug(rf.me, rf.currentTerm, "prev commit=%d, curr commit=%d\n", oldCommitIndex, rf.commitIndex)
 	if rf.commitIndex > oldCommitIndex {
 		// signal commit changes for worker to apply commited logs
-		rf.commitCh <- true
+		// rf.commitCh <- true
+		rf.checkCommit()
 	}
 }
 
@@ -825,10 +871,9 @@ func startReplicationStatusChecker(rf *Raft) {
 			}
 			debug(rf.me, rf.currentTerm, "prev commit=%d, curr commit=%d\n", oldCommitIndex, rf.commitIndex)
 			if rf.commitIndex > oldCommitIndex {
-				// wait all Start() up
-				rf.c.Broadcast()
 				// signal commit changes for worker to apply commited logs
-				rf.commitCh <- true
+				// rf.commitCh <- true
+				rf.checkCommit()
 			}
 			rf.mu.Unlock()
 		case <-rf.quit:
@@ -892,27 +937,40 @@ func startElectionWorker(rf *Raft) {
 
 // for AppendEntries (heartbeat and log)
 func startAppendEntriesWorkers(rf *Raft) {
-	triggers := make([]chan bool, len(rf.peers))
+	/* triggers := make([]chan bool, len(rf.peers))
 	for i := range rf.peers {
 		triggers[i] = make(chan bool)
 		if i != rf.me {
 			go startAppendEntryWorker(rf, i, triggers[i])
 		}
-	}
+	} */
 
 	for {
+		rf.mu.Lock()
+		for rf.role != leader {
+			debug(rf.me, rf.currentTerm, "not a leader, waiting\n")
+			rf.c.Wait()
+			select {
+			case <-rf.quit:
+				rf.debug("stops append entries goroutine\n")
+				return
+			default:
+			}
+		}
+		rf.mu.Unlock()
 		select {
 		case shouldSend := <-rf.appendEntriesCh:
-			// reset timer and send AppendEntries request
-			triggerAll(triggers, shouldSend)
-		case <-rf.quit:
-			rf.debug("stops append entries goroutine\n")
-			return
+			if shouldSend {
+				startAppendEntryLoop(rf)
+			}
+		case <-time.After(time.Duration(getHeartbeatInterval()) * time.Millisecond):
+			startAppendEntryLoop(rf)
 		}
+		time.Sleep(time.Duration(getHeartbeatInterval()) * time.Millisecond)
 	}
 }
 
-func triggerAll(triggers []chan bool, shouldSend bool) {
+/* func triggerAll(triggers []chan bool, shouldSend bool) {
 	for _, ch := range triggers {
 		ch := ch
 		select {
@@ -920,9 +978,26 @@ func triggerAll(triggers []chan bool, shouldSend bool) {
 		default:
 		}
 	}
+} */
+
+func startAppendEntryLoop(rf *Raft) {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(server int) {
+			success := false
+			rf.mu.Lock()
+			term := rf.currentTerm
+			rf.mu.Unlock()
+			for !success {
+				success = sendAppendEntriesRequest(rf, server, term)
+			}
+		}(i)
+	}
 }
 
-func startAppendEntryWorker(rf *Raft, server int, ch chan bool) {
+/* func startAppendEntryWorker(rf *Raft, server int, ch chan bool) {
 	timer := resetTimer(rf, getHeartbeatInterval, heartBeatTimerName)
 	for {
 		select {
@@ -946,10 +1021,10 @@ func startAppendEntryWorker(rf *Raft, server int, ch chan bool) {
 			return
 		}
 	}
-}
+} */
 
 // send append entries requests to all servers
-func sendAppendEntriesRequest(rf *Raft, server int) bool {
+func sendAppendEntriesRequest(rf *Raft, server int, term int) bool {
 	var currTerm int
 	var role peerRole
 	var entries []*logEntry
@@ -977,7 +1052,7 @@ func sendAppendEntriesRequest(rf *Raft, server int) bool {
 	}
 	rf.mu.Unlock()
 
-	if role != leader {
+	if role != leader || currTerm != term {
 		// not leader anymore, or term changed
 		// debug(rf.me, currTerm, "not a leader, not sending AppendEntries requests\n")
 		return true
@@ -1009,12 +1084,6 @@ func sendAppendEntriesRequest(rf *Raft, server int) bool {
 		debug(rf.me, currTerm, "fail to send AppendEntries to peer=%d\n", server)
 	} else {
 		rf.mu.Lock()
-		if rf.currentTerm != currTerm {
-			// not in the same term as we send this request, ignore this response
-			debug(rf.me, rf.currentTerm, "AppendEntries sent in old term=%d, ignore\n", currTerm)
-			rf.mu.Unlock()
-			return true
-		}
 		// check if the peer has higher term (if yes, become a follower)
 		if reply.Term > rf.currentTerm {
 			debug(rf.me, rf.currentTerm, "receives higher term=%d, change to follower\n", reply.Term)
@@ -1027,10 +1096,22 @@ func sendAppendEntriesRequest(rf *Raft, server int) bool {
 			rf.mu.Unlock()
 			return true
 		}
+		if rf.role != leader {
+			debug(rf.me, rf.currentTerm, "ignore append entries response, not leader anymore\n")
+			rf.mu.Unlock()
+			return true
+		}
+		if rf.currentTerm != currTerm {
+			// not in the same term as we send this request, ignore this response
+			debug(rf.me, rf.currentTerm, "AppendEntries sent in old term=%d, ignore\n", currTerm)
+			rf.mu.Unlock()
+			return true
+		}
 		if !reply.Success {
 			debug(rf.me, currTerm, "AppendEntries rejected by peer=%d\n", server)
 			// index not changed
-			if reply.ConflictTerm == 0 {
+			rf.nextIndex[server] = max(1, reply.FirstLogIndex)
+			/* if reply.ConflictTerm == 0 {
 				rf.nextIndex[server] = max(1, reply.FirstLogIndex)
 			} else {
 				lastTermIndex := rf.logCount
@@ -1047,9 +1128,9 @@ func sendAppendEntriesRequest(rf *Raft, server int) bool {
 				if lastTermIndex == -1 {
 					rf.nextIndex[server] = max(reply.FirstLogIndex, 1)
 				} else {
-					rf.nextIndex[server] = reply.FirstLogIndex + 1
+					rf.nextIndex[server] = lastTermIndex + 1
 				}
-			}
+			} */
 			debug(rf.me, currTerm, "decrement nextIndex[%d] to %d\n", server, rf.nextIndex[server])
 		} else {
 			// update matchIndex and nextIndex
@@ -1087,4 +1168,12 @@ func max(v1 int, v2 int) int {
 		return v1
 	}
 	return v2
+}
+
+func drainAndAdd(c chan bool, val bool) {
+	select {
+	case <-c:
+	default:
+	}
+	c <- val
 }
