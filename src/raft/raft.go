@@ -592,6 +592,9 @@ func (rf *Raft) startElection() {
 	rf.role = candidate
 	// vote itself
 	rf.votedFor = &rf.me
+	go func() {
+		rf.electionTimerCh <- true
+	}()
 	rf.persist()
 	eleTerm := rf.currentTerm
 	// channel for granted votes
